@@ -4,6 +4,7 @@ on: [workflow_dispatch]
 jobs:
   full-rdp:
     runs-on: windows-latest
+    timeout-minutes: 360
     
     steps:
     - name: Create new user for RDP
@@ -23,61 +24,111 @@ jobs:
         
     - name: Start required services
       run: |
-        Start-Service -Name "TermService"
+        Start-Service -Name "TermService" -ErrorAction SilentlyContinue
         Set-Service -Name "TermService" -StartupType Automatic
         
     - name: Download and setup Ngrok
       run: |
         Invoke-WebRequest https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip -OutFile ngrok.zip
         Expand-Archive ngrok.zip -Force
-        .\ngrok\ngrok.exe authtoken $env:NGROK_AUTH_TOKEN
+        .\ngrok\ngrok.exe config add-authtoken $env:NGROK_AUTH_TOKEN
       env:
         NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
         
-    - name: Start Ngrok tunnel
+    - name: Start Ngrok tunnel and get public URL
       run: |
-        # Start ngrok in background
-        Start-Process -FilePath ".\ngrok\ngrok.exe" -ArgumentList "tcp 3389 --log stdout"
-        Start-Sleep -Seconds 5
+        # Kill any existing ngrok processes
+        Get-Process -Name "ngrok" -ErrorAction SilentlyContinue | Stop-Process -Force
         
-    - name: Get Ngrok public URL
-      run: |
-        # Get the public URL from ngrok API
+        # Start ngrok tunnel for RDP
+        $ngrokProcess = Start-Process -FilePath ".\ngrok\ngrok.exe" -ArgumentList "tcp 3389 --log=stdout" -PassThru
+        
+        # Wait for ngrok to start and get tunnel information
+        Write-Host "Waiting for ngrok tunnel to be established..."
+        $tunnelReady = $false
         $retryCount = 0
-        $maxRetries = 10
-        do {
-            Start-Sleep -Seconds 3
+        $maxRetries = 15
+        
+        while (-not $tunnelReady -and $retryCount -lt $maxRetries) {
             try {
-                $tunnels = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -ErrorAction Stop
-                $public_url = $tunnels.tunnels[0].public_url
-                if ($public_url) {
-                    Write-Host "=========================================="
-                    Write-Host "🎉 RDP CONNECTION SUCCESSFULLY SETUP! 🎉"
-                    Write-Host "=========================================="
-                    Write-Host "Public RDP URL: $public_url"
-                    Write-Host "Username: github-rdp-user"
-                    Write-Host "Password: YourSecurePassword123!"
-                    Write-Host ""
-                    Write-Host "📝 CONNECTION INSTRUCTIONS:"
-                    Write-Host "1. The URL looks like: tcp://X.tcp.ngrok.io:XXXXX"
-                    Write-Host "2. Use Remote Desktop Connection"
-                    Write-Host "3. Computer: X.tcp.ngrok.io:XXXXX"
-                    Write-Host "4. Username: github-rdp-user"
-                    Write-Host "5. Password: YourSecurePassword123!"
-                    Write-Host "=========================================="
-                    break
+                Start-Sleep -Seconds 5
+                $response = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -ErrorAction Stop
+                
+                if ($response.tunnels -and $response.tunnels.Count -gt 0) {
+                    $public_url = $response.tunnels[0].public_url
+                    if ($public_url -match 'tcp://(.+):(\d+)') {
+                        $tunnelReady = $true
+                        $hostname = $matches[1]
+                        $port = $matches[2]
+                        
+                        Write-Host "=========================================="
+                        Write-Host "🎉 RDP CONNECTION SUCCESSFULLY SETUP! 🎉"
+                        Write-Host "=========================================="
+                        Write-Host "Public RDP URL: $public_url"
+                        Write-Host "Hostname: $hostname"
+                        Write-Host "Port: $port"
+                        Write-Host "Username: github-rdp-user"
+                        Write-Host "Password: YourSecurePassword123!"
+                        Write-Host ""
+                        Write-Host "📝 CONNECTION INSTRUCTIONS:"
+                        Write-Host "1. Use Remote Desktop Connection"
+                        Write-Host "2. Computer: $hostname`:$port"
+                        Write-Host "3. Username: github-rdp-user"
+                        Write-Host "4. Password: YourSecurePassword123!"
+                        Write-Host ""
+                        Write-Host "⚠️  IMPORTANT:"
+                        Write-Host "- This session will automatically end after 6 hours"
+                        Write-Host "- Do not close this workflow run"
+                        Write-Host "=========================================="
+                        
+                        # Set output for future steps
+                        echo "RDP_HOSTNAME=$hostname" >> $env:GITHUB_ENV
+                        echo "RDP_PORT=$port" >> $env:GITHUB_ENV
+                    }
                 }
             } catch {
                 Write-Host "Waiting for ngrok tunnel to be ready... ($retryCount/$maxRetries)"
+                $retryCount++
             }
-            $retryCount++
-        } while ($retryCount -lt $maxRetries)
+        }
         
-    - name: Keep session alive
+        if (-not $tunnelReady) {
+            Write-Host "❌ Failed to establish ngrok tunnel after $maxRetries attempts"
+            # Get ngrok logs for debugging
+            try {
+                $ngrokLogs = Get-Content -Path "$env:TEMP\ngrok.log" -ErrorAction SilentlyContinue
+                if ($ngrokLogs) {
+                    Write-Host "Ngrok logs:"
+                    Write-Host $ngrokLogs
+                }
+            } catch {
+                Write-Host "No ngrok logs available"
+            }
+            exit 1
+        }
+        
+    - name: Keep RDP session alive
       run: |
         Write-Host "RDP session is active for 6 hours maximum..."
-        # Ping every minute to keep alive
-        for ($i = 0; $i -lt 360; $i++) {
-            Write-Host "Session active - $(Get-Date) - Time remaining: $((360 - $i)*60) seconds"
+        Write-Host "Monitoring ngrok tunnel status..."
+        
+        $sessionDuration = 360 # 6 hours in minutes
+        for ($i = 0; $i -lt $sessionDuration; $i++) {
+            $timeRemaining = ($sessionDuration - $i)
+            Write-Host "Session active - $(Get-Date) - Time remaining: $($timeRemaining) minutes"
+            
+            # Check if ngrok tunnel is still active
+            try {
+                $tunnels = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -ErrorAction Stop
+                if ($tunnels.tunnels.Count -eq 0) {
+                    Write-Host "❌ Ngrok tunnel appears to be down. Restarting..."
+                    # You could add tunnel restart logic here if needed
+                }
+            } catch {
+                Write-Host "⚠️  Could not check tunnel status: $($_.Exception.Message)"
+            }
+            
             Start-Sleep -Seconds 60
         }
+        
+        Write-Host "⏰ RDP session time limit reached. Shutting down..."
