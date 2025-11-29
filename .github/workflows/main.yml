@@ -58,6 +58,7 @@ net:
     bindIp: 127.0.0.1
     port: 27017
 "@
+            # Fixed the file path - removed extra quote
             $configContent | Out-File -FilePath "C:\Program Files\MongoDB\Server\6.0\bin\mongod.cfg" -Encoding utf8
             
             # Start MongoDB service
@@ -115,11 +116,11 @@ net:
         # Kill any existing ngrok processes
         Get-Process -Name "ngrok" -ErrorAction SilentlyContinue | Stop-Process -Force
         
-        # Start ngrok tunnels for RDP (3389) and MongoDB (27017)
-        $ngrokProcess = Start-Process -FilePath "ngrok" -ArgumentList "start --none" -PassThru
-        
-        # Wait for ngrok to start
-        Start-Sleep -Seconds 3
+        # Create ngrok configuration directory if it doesn't exist
+        $ngrokConfigDir = "$env:USERPROFILE\.ngrok2"
+        if (-not (Test-Path $ngrokConfigDir)) {
+            New-Item -ItemType Directory -Path $ngrokConfigDir -Force
+        }
         
         # Create ngrok configuration for multiple tunnels
         $ngrokConfig = @"
@@ -134,7 +135,7 @@ tunnels:
     addr: 27017
 "@
         
-        $ngrokConfig | Out-File -FilePath "$env:USERPROFILE\.ngrok2\ngrok.yml" -Encoding utf8
+        $ngrokConfig | Out-File -FilePath "$ngrokConfigDir\ngrok.yml" -Encoding utf8
         
         # Start all tunnels
         Start-Process -FilePath "ngrok" -ArgumentList "start --all" -WindowStyle Hidden
