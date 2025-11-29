@@ -1,218 +1,78 @@
-name: RDP with Ngrok Tunnel and MongoDB
+name: RDP with Ngrok Tunnel
 on: [workflow_dispatch]
 
 jobs:
   full-rdp:
     runs-on: windows-latest
     timeout-minutes: 360
-
+    
     steps:
-    - name: Install Chocolatey packages
-      shell: pwsh
-      run: |
-        # Install Chocolatey if not already installed
-        Set-ExecutionPolicy Bypass -Scope Process -Force
-        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
-        iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-
-        # Refresh environment variables
-        $env:ChocolateyInstall = Convert-Path "$((Get-Command choco).Path)\..\.."   
-        Import-Module "$env:ChocolateyInstall\helpers\chocolateyProfile.psm1"
-
-        # Install MongoDB Community Edition
-        choco install mongodb -y --version=6.0.9 --params="'/InstallationType:JustInstall'"
-
-        # Install Ngrok
-        choco install ngrok -y
-
-        # Refresh PATH to ensure ngrok is available
-        refreshenv
-
-    - name: Configure MongoDB Service
-      shell: pwsh
-      run: |
-        # Create MongoDB data and log directories
-        $mongoDataPath = "C:\data\db"
-        $mongoLogPath = "C:\data\log"
-
-        if (-not (Test-Path $mongoDataPath)) {
-            New-Item -Path $mongoDataPath -ItemType Directory -Force | Out-Null
-        }
-        if (-not (Test-Path $mongoLogPath)) {
-            New-Item -Path $mongoLogPath -ItemType Directory -Force | Out-Null
-        }
-
-        # Configure and start MongoDB service
-        Write-Host "Configuring MongoDB service..."
-        try {
-            # Stop if already running
-            Stop-Service -Name "MongoDB" -ErrorAction SilentlyContinue
-
-            # Create MongoDB config file (use an expandable here-string)
-            $configContent = @"
-systemLog:
-  destination: file
-  path: C:\data\log\mongod.log
-  logAppend: true
-storage:
-  dbPath: C:\data\db
-net:
-  bindIp: 127.0.0.1
-  port: 27017
-"@
-
-            $configPath = "C:\Program Files\MongoDB\Server\6.0\bin\mongod.cfg"
-            $configContent | Out-File -FilePath $configPath -Encoding utf8 -Force
-
-            # Start MongoDB service (service name depends on package; this assumes 'MongoDB')
-            Start-Service -Name "MongoDB" -ErrorAction Stop
-            Write-Host "✅ MongoDB service started successfully"
-
-            # Wait a moment for service to fully start
-            Start-Sleep -Seconds 5
-
-            # Test MongoDB connection
-            & "C:\Program Files\MongoDB\Server\6.0\bin\mongo.exe" --eval "db.version()" --quiet
-            if ($LASTEXITCODE -eq 0) {
-                Write-Host "✅ MongoDB is running and accessible"
-            } else {
-                Write-Host "⚠️ MongoDB service might need manual configuration"
-            }
-
-        } catch {
-            Write-Host "❌ Failed to start MongoDB service: $($_.Exception.Message)"
-            Write-Host "You may need to manually configure MongoDB after RDP connection"
-        }
-
     - name: Create new user for RDP
-      shell: pwsh
       run: |
         $username = "github-rdp-user"
-        $passwordPlain = "YourSecurePassword123!"
-
-        if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
-            $securePass = ConvertTo-SecureString $passwordPlain -AsPlainText -Force
-            New-LocalUser -Name $username -Password $securePass -FullName "GitHub RDP User" -Description "Temporary RDP user"
-            Add-LocalGroupMember -Group "Administrators" -Member $username
-            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
-            Write-Host "✅ Local user $username created."
-        } else {
-            Write-Host "ℹ️ Local user $username already exists, skipping creation."
-        }
-
+        $password = "YourSecurePassword123!"
+        
+        New-LocalUser -Name $username -Password (ConvertTo-SecureString $password -AsPlainText -Force) -FullName "GitHub RDP User" -Description "Temporary RDP user"
+        Add-LocalGroupMember -Group "Administrators" -Member $username
+        Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+        
     - name: Configure RDP settings
-      shell: pwsh
       run: |
         Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
         Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
         Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-
+        
     - name: Start required services
-      shell: pwsh
       run: |
         Start-Service -Name "TermService" -ErrorAction SilentlyContinue
         Set-Service -Name "TermService" -StartupType Automatic
-
-    - name: Configure Ngrok authtoken
-      shell: pwsh
-      env:
-        NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+        
+    - name: Download and setup Ngrok
       run: |
-        refreshenv
-
-        if (-not $env:NGROK_AUTH_TOKEN) {
-            Write-Host "❌ NGROK_AUTH_TOKEN is not set in secrets. Aborting."
-            exit 1
-        }
-
-        # Configure ngrok authtoken
-        ngrok config add-authtoken $env:NGROK_AUTH_TOKEN
-
-    - name: Start Ngrok tunnels for RDP and MongoDB
-      shell: pwsh
+        Invoke-WebRequest https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip -OutFile ngrok.zip
+        Expand-Archive ngrok.zip -Force
+        .\ngrok\ngrok.exe config add-authtoken $env:NGROK_AUTH_TOKEN
       env:
         NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+        
+    - name: Start Ngrok tunnel and get public URL
       run: |
         # Kill any existing ngrok processes
-        Get-Process -Name "ngrok" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-
-        # Create ngrok configuration directory if it doesn't exist
-        $ngrokConfigDir = Join-Path $env:USERPROFILE ".ngrok2"
-        if (-not (Test-Path $ngrokConfigDir)) {
-            New-Item -ItemType Directory -Path $ngrokConfigDir -Force | Out-Null
-        }
-
-        # Create ngrok configuration for multiple tunnels.
-        # Use a single-quoted here-string to avoid accidental variable expansion.
-        $ngrokConfig = @'
-version: "2"
-authtoken: YOUR_AUTHTOKEN_PLACEHOLDER
-tunnels:
-  rdp:
-    proto: tcp
-    addr: 3389
-  mongodb:
-    proto: tcp
-    addr: 27017
-'@
-
-        # Replace placeholder with actual token safely
-        $ngrokConfig = $ngrokConfig -replace "YOUR_AUTHTOKEN_PLACEHOLDER", $env:NGROK_AUTH_TOKEN
-
-        $ngrokConfig | Out-File -FilePath (Join-Path $ngrokConfigDir "ngrok.yml") -Encoding utf8 -Force
-
-        # Start all tunnels (run in background)
-        Start-Process -FilePath "ngrok" -ArgumentList "start --all" -WindowStyle Hidden
-
-        # Wait for tunnels to establish
-        Write-Host "Waiting for ngrok tunnels to be established..."
-        $tunnelsReady = $false
+        Get-Process -Name "ngrok" -ErrorAction SilentlyContinue | Stop-Process -Force
+        
+        # Start ngrok tunnel for RDP
+        $ngrokProcess = Start-Process -FilePath ".\ngrok\ngrok.exe" -ArgumentList "tcp 3389 --log=stdout" -PassThru
+        
+        # Wait for ngrok to start and get tunnel information
+        Write-Host "Waiting for ngrok tunnel to be established..."
+        $tunnelReady = $false
         $retryCount = 0
-        $maxRetries = 20
-
-        while (-not $tunnelsReady -and $retryCount -lt $maxRetries) {
+        $maxRetries = 15
+        
+        while (-not $tunnelReady -and $retryCount -lt $maxRetries) {
             try {
-                Start-Sleep -Seconds 3
+                Start-Sleep -Seconds 5
                 $response = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -ErrorAction Stop
-
-                if ($response.tunnels -and $response.tunnels.Count -ge 2) {
-                    $rdpTunnel = $response.tunnels | Where-Object { $_.name -eq "rdp" }
-                    $mongoTunnel = $response.tunnels | Where-Object { $_.name -eq "mongodb" }
-
-                    if ($rdpTunnel -and $mongoTunnel) {
-                        $tunnelsReady = $true
-
-                        # Parse RDP tunnel info
-                        if ($rdpTunnel.public_url -match 'tcp://(.+):(\d+)') {
-                            $rdpHostname = $matches[1]
-                            $rdpPort = $matches[2]
-                        }
-
-                        # Parse MongoDB tunnel info
-                        if ($mongoTunnel.public_url -match 'tcp://(.+):(\d+)') {
-                            $mongoHostname = $matches[1]
-                            $mongoPort = $matches[2]
-                        }
-
+                
+                if ($response.tunnels -and $response.tunnels.Count -gt 0) {
+                    $public_url = $response.tunnels[0].public_url
+                    if ($public_url -match 'tcp://(.+):(\d+)') {
+                        $tunnelReady = $true
+                        $hostname = $matches[1]
+                        $port = $matches[2]
+                        
                         Write-Host "=========================================="
-                        Write-Host "🎉 RDP & MONGODB SUCCESSFULLY SETUP! 🎉"
+                        Write-Host "🎉 RDP CONNECTION SUCCESSFULLY SETUP! 🎉"
                         Write-Host "=========================================="
-                        Write-Host "📱 RDP CONNECTION:"
-                        Write-Host "Public URL: $($rdpTunnel.public_url)"
-                        Write-Host "Hostname: $rdpHostname"
-                        Write-Host "Port: $rdpPort"
+                        Write-Host "Public RDP URL: $public_url"
+                        Write-Host "Hostname: $hostname"
+                        Write-Host "Port: $port"
                         Write-Host "Username: github-rdp-user"
                         Write-Host "Password: YourSecurePassword123!"
                         Write-Host ""
-                        Write-Host "🗄️  MONGODB CONNECTION:"
-                        Write-Host "Public URL: $($mongoTunnel.public_url)"
-                        Write-Host "Hostname: $mongoHostname"
-                        Write-Host "Port: $mongoPort"
-                        Write-Host "Connection String: mongodb://$mongoHostname:$mongoPort/"
-                        Write-Host ""
-                        Write-Host "📝 RDP INSTRUCTIONS:"
+                        Write-Host "📝 CONNECTION INSTRUCTIONS:"
                         Write-Host "1. Use Remote Desktop Connection"
-                        Write-Host "2. Computer: $rdpHostname:$rdpPort"
+                        Write-Host "2. Computer: $hostname`:$port"
                         Write-Host "3. Username: github-rdp-user"
                         Write-Host "4. Password: YourSecurePassword123!"
                         Write-Host ""
@@ -220,58 +80,55 @@ tunnels:
                         Write-Host "- This session will automatically end after 6 hours"
                         Write-Host "- Do not close this workflow run"
                         Write-Host "=========================================="
-
-                        # Set outputs / environment variables for future steps (use Add-Content for Windows)
-                        Add-Content -Path $env:GITHUB_ENV -Value "RDP_HOSTNAME=$rdpHostname"
-                        Add-Content -Path $env:GITHUB_ENV -Value "RDP_PORT=$rdpPort"
-                        Add-Content -Path $env:GITHUB_ENV -Value "MONGO_HOSTNAME=$mongoHostname"
-                        Add-Content -Path $env:GITHUB_ENV -Value "MONGO_PORT=$mongoPort"
+                        
+                        # Set output for future steps
+                        echo "RDP_HOSTNAME=$hostname" >> $env:GITHUB_ENV
+                        echo "RDP_PORT=$port" >> $env:GITHUB_ENV
                     }
                 }
             } catch {
-                Write-Host "Waiting for ngrok tunnels to be ready... ($retryCount/$maxRetries)"
+                Write-Host "Waiting for ngrok tunnel to be ready... ($retryCount/$maxRetries)"
                 $retryCount++
             }
         }
-
-        if (-not $tunnelsReady) {
-            Write-Host "❌ Failed to establish ngrok tunnels after $maxRetries attempts"
+        
+        if (-not $tunnelReady) {
+            Write-Host "❌ Failed to establish ngrok tunnel after $maxRetries attempts"
+            # Get ngrok logs for debugging
+            try {
+                $ngrokLogs = Get-Content -Path "$env:TEMP\ngrok.log" -ErrorAction SilentlyContinue
+                if ($ngrokLogs) {
+                    Write-Host "Ngrok logs:"
+                    Write-Host $ngrokLogs
+                }
+            } catch {
+                Write-Host "No ngrok logs available"
+            }
             exit 1
         }
-
-    - name: Keep session alive
-      shell: pwsh
+        
+    - name: Keep RDP session alive
       run: |
-        Write-Host "RDP and MongoDB sessions are active for 6 hours maximum..."
-        Write-Host "Monitoring services status..."
-
+        Write-Host "RDP session is active for 6 hours maximum..."
+        Write-Host "Monitoring ngrok tunnel status..."
+        
         $sessionDuration = 360 # 6 hours in minutes
         for ($i = 0; $i -lt $sessionDuration; $i++) {
             $timeRemaining = ($sessionDuration - $i)
             Write-Host "Session active - $(Get-Date) - Time remaining: $($timeRemaining) minutes"
-
-            # Check MongoDB service status
-            $mongoStatus = Get-Service -Name "MongoDB" -ErrorAction SilentlyContinue
-            if ($mongoStatus -and $mongoStatus.Status -ne "Running") {
-                Write-Host "⚠️  MongoDB service is not running. Attempting to restart..."
-                try {
-                    Start-Service -Name "MongoDB" -ErrorAction Stop
-                    Write-Host "✅ MongoDB service restarted"
-                } catch {
-                    Write-Host "❌ Failed to restart MongoDB: $($_.Exception.Message)"
-                }
-            }
-
-            # Check ngrok tunnel status
+            
+            # Check if ngrok tunnel is still active
             try {
                 $tunnels = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -ErrorAction Stop
-                $activeTunnels = $tunnels.tunnels.Count
-                Write-Host "Active ngrok tunnels: $activeTunnels"
+                if ($tunnels.tunnels.Count -eq 0) {
+                    Write-Host "❌ Ngrok tunnel appears to be down. Restarting..."
+                    # You could add tunnel restart logic here if needed
+                }
             } catch {
                 Write-Host "⚠️  Could not check tunnel status: $($_.Exception.Message)"
             }
-
+            
             Start-Sleep -Seconds 60
         }
-
-        Write-Host "⏰ Session time limit reached. Shutting down..."
+        
+        Write-Host "⏰ RDP session time limit reached. Shutting down..."
